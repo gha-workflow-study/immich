@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:auto_route/auto_route.dart';
 import 'package:easy_localization/easy_localization.dart';
@@ -14,12 +16,11 @@ import 'package:immich_mobile/extensions/build_context_extensions.dart';
 import 'package:immich_mobile/extensions/platform_extensions.dart';
 import 'package:immich_mobile/extensions/scroll_extensions.dart';
 import 'package:immich_mobile/presentation/widgets/action_buttons/download_status_floating_button.widget.dart';
-import 'package:immich_mobile/presentation/widgets/asset_viewer/activities_bottom_sheet.widget.dart';
+import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_details.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_stack.provider.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_stack.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/asset_viewer.state.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/bottom_bar.widget.dart';
-import 'package:immich_mobile/presentation/widgets/asset_viewer/bottom_sheet.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/top_app_bar.widget.dart';
 import 'package:immich_mobile/presentation/widgets/asset_viewer/video_viewer.widget.dart';
 import 'package:immich_mobile/presentation/widgets/images/image_provider.dart';
@@ -30,7 +31,6 @@ import 'package:immich_mobile/providers/asset_viewer/video_player_value_provider
 import 'package:immich_mobile/providers/cast.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/asset_viewer/current_asset.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/current_album.provider.dart';
-import 'package:immich_mobile/providers/infrastructure/readonly_mode.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/timeline.provider.dart';
 import 'package:immich_mobile/widgets/common/immich_loading_indicator.dart';
 import 'package:immich_mobile/widgets/photo_view/photo_view.dart';
@@ -79,10 +79,6 @@ class AssetViewer extends ConsumerStatefulWidget {
     _setAsset(ref, asset);
   }
 
-  void changeAsset(WidgetRef ref, BaseAsset asset) {
-    _setAsset(ref, asset);
-  }
-
   static void _setAsset(WidgetRef ref, BaseAsset asset) {
     // Always holds the current asset from the timeline
     ref.read(assetViewerProvider.notifier).setAsset(asset);
@@ -94,45 +90,43 @@ class AssetViewer extends ConsumerStatefulWidget {
       ref.read(videoPlayerControlsProvider.notifier).pause();
     }
     // Hide controls by default for videos
-    if (asset.isVideo) {
-      ref.read(assetViewerProvider.notifier).setControls(false);
-    }
+    if (asset.isVideo) ref.read(assetViewerProvider.notifier).setControls(false);
   }
 }
 
-const double _kBottomSheetMinimumExtent = 0.4;
-const double _kBottomSheetSnapExtent = 0.67;
+enum _DragIntent { none, dismiss, scroll }
 
-class _AssetViewerState extends ConsumerState<AssetViewer> {
-  static final _dummyListener = ImageStreamListener((image, _) => image.dispose());
+class _AssetViewerState extends ConsumerState<AssetViewer> with TickerProviderStateMixin {
+  static final _snapSpring = SpringDescription.withDampingRatio(mass: 0.5, stiffness: 100.0, ratio: 1.1);
+  static const _minFlingVelocity = 15.0;
+  static const _minSnapDistance = 25.0;
+
   late PageController pageController;
-  late DraggableScrollableController bottomSheetController;
-  PersistentBottomSheetController? sheetCloseController;
-  // PhotoViewGallery takes care of disposing it's controllers
+  // PhotoViewGallery takes care of disposing its controllers
   PhotoViewControllerBase? viewController;
-  StreamSubscription? reloadSubscription;
+  final ScrollController _scrollController = ScrollController();
+  late final AnimationController _ballisticAnimController;
 
-  late final int heroOffset;
-  late PhotoViewControllerValue initialPhotoViewState;
-  bool? hasDraggedDown;
-  bool isSnapping = false;
+  StreamSubscription? reloadSubscription;
+  StreamSubscription? _scaleBoundarySub;
+
   bool blockGestures = false;
   bool dragInProgress = false;
   bool shouldPopOnDrag = false;
-  bool assetReloadRequested = false;
-  double previousExtent = _kBottomSheetMinimumExtent;
+  _DragIntent _dragIntent = _DragIntent.none;
+  Offset _dragStartGlobalPosition = Offset.zero;
   Offset dragDownPosition = Offset.zero;
+  late PhotoViewControllerValue initialPhotoViewState;
+
+  double _snapOffset = 0.0;
+  double _previousScrollOffset = 0.0;
+
+  late final int heroOffset;
+  bool assetReloadRequested = false;
   int totalAssets = 0;
-  int stackIndex = 0;
-  BuildContext? scaffoldContext;
   Map<String, GlobalKey> videoPlayerKeys = {};
 
-  // Delayed operations that should be cancelled on disposal
-  final List<Timer> _delayedOperations = [];
-
-  ImageStream? _prevPreCacheStream;
-  ImageStream? _nextPreCacheStream;
-
+  late final _AssetPreloader _preloader;
   KeepAliveLink? _stackChildrenKeepAlive;
 
   @override
@@ -140,94 +134,262 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
     super.initState();
     assert(ref.read(currentAssetNotifier) != null, "Current asset should not be null when opening the AssetViewer");
     pageController = PageController(initialPage: widget.initialIndex);
-    totalAssets = ref.read(timelineServiceProvider).totalAssets;
-    bottomSheetController = DraggableScrollableController();
+    _scrollController.addListener(_onScroll);
+    _ballisticAnimController = AnimationController.unbounded(vsync: this)..addListener(_onBallisticTick);
+    final timelineService = ref.read(timelineServiceProvider);
+    totalAssets = timelineService.totalAssets;
+    _preloader = _AssetPreloader(timelineService: timelineService, mounted: () => mounted);
     WidgetsBinding.instance.addPostFrameCallback(_onAssetInit);
     reloadSubscription = EventStream.shared.listen(_onEvent);
     heroOffset = widget.heroOffset ?? TabsRouterScope.of(context)?.controller.activeIndex ?? 0;
     final asset = ref.read(currentAssetNotifier);
-    if (asset != null) {
-      _stackChildrenKeepAlive = ref.read(stackChildrenNotifier(asset).notifier).ref.keepAlive();
-    }
-    if (ref.read(assetViewerProvider).showingControls) {
-      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
-    } else {
-      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
-    }
+    if (asset != null) _stackChildrenKeepAlive = ref.read(stackChildrenNotifier(asset).notifier).ref.keepAlive();
   }
 
   @override
   void dispose() {
+    _ballisticAnimController.dispose();
+    _scrollController.dispose();
     pageController.dispose();
-    bottomSheetController.dispose();
-    _cancelTimers();
+    _preloader.dispose();
     reloadSubscription?.cancel();
-    _prevPreCacheStream?.removeListener(_dummyListener);
-    _nextPreCacheStream?.removeListener(_dummyListener);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    _scaleBoundarySub?.cancel();
     _stackChildrenKeepAlive?.close();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
 
-  bool get showingBottomSheet => ref.read(assetViewerProvider.select((s) => s.showingBottomSheet));
-
-  Color get backgroundColor {
-    final opacity = ref.read(assetViewerProvider.select((s) => s.backgroundOpacity));
-    return Colors.black.withAlpha(opacity);
+  Tolerance get _scrollTolerance {
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    return Tolerance(velocity: 1.0 / (0.05 * dpr), distance: 1.0 / dpr);
   }
 
-  void _cancelTimers() {
-    for (final timer in _delayedOperations) {
-      timer.cancel();
+  void _onScroll() {
+    final offset = _scrollController.offset;
+    ref
+        .read(assetViewerProvider.notifier)
+        .updateShowingDetailsFromScroll(
+          scrollingUp: offset > _previousScrollOffset,
+          offset: offset,
+          minOffset: 5,
+          snapOffset: _snapOffset,
+        );
+    _previousScrollOffset = offset;
+  }
+
+  /// Drive the scroll controller by [dy] pixels (positive = scroll down).
+  void _scrollBy(double dy) {
+    if (!_scrollController.hasClients) return;
+    final newOffset = (_scrollController.offset - dy).clamp(0.0, _scrollController.position.maxScrollExtent);
+    _scrollController.jumpTo(newOffset);
+  }
+
+  /// Animate the scroll position to [target] using a spring simulation.
+  void _animateScrollTo(double target, double velocity) {
+    final offset = _scrollController.offset;
+    final tolerance = _scrollTolerance;
+    if ((offset - target).abs() < tolerance.distance) {
+      _scrollController.jumpTo(target);
+      return;
     }
-    _delayedOperations.clear();
+    _ballisticAnimController.value = offset;
+    _ballisticAnimController.animateWith(
+      ScrollSpringSimulation(_snapSpring, offset, target, velocity, tolerance: tolerance),
+    );
   }
 
-  double _getVerticalOffsetForBottomSheet(double extent) =>
-      (context.height * extent) - (context.height * _kBottomSheetMinimumExtent);
-
-  ImageStream _precacheImage(BaseAsset asset) {
-    final provider = getFullImageProvider(asset, size: context.sizeData);
-    return provider.resolve(ImageConfiguration.empty)..addListener(_dummyListener);
+  Simulation _createFlingSimulation(double offset, double velocity) {
+    final tolerance = _scrollTolerance;
+    return CurrentPlatform.isIOS
+        ? BouncingScrollSimulation(
+            position: offset,
+            velocity: velocity,
+            leadingExtent: _snapOffset,
+            trailingExtent: _scrollController.position.maxScrollExtent,
+            spring: _snapSpring,
+            tolerance: tolerance,
+          )
+        : ClampingScrollSimulation(position: offset, velocity: velocity, tolerance: tolerance);
   }
 
-  void _precacheAssets(int index) {
-    final timelineService = ref.read(timelineServiceProvider);
-    unawaited(timelineService.preCacheAssets(index));
-    _cancelTimers();
-    // This will trigger the pre-caching of adjacent assets ensuring
-    // that they are ready when the user navigates to them.
-    final timer = Timer(Durations.medium4, () async {
-      // Check if widget is still mounted before proceeding
-      if (!mounted) return;
+  void _onBallisticTick() {
+    if (!_scrollController.hasClients) return;
+    final raw = _ballisticAnimController.value;
+    final max = _scrollController.position.maxScrollExtent;
+    final offset = raw.clamp(0.0, max);
+    final prevOffset = _scrollController.offset;
 
-      final (prevAsset, nextAsset) = await (
-        timelineService.getAssetAsync(index - 1),
-        timelineService.getAssetAsync(index + 1),
-      ).wait;
-      if (!mounted) return;
-      _prevPreCacheStream?.removeListener(_dummyListener);
-      _nextPreCacheStream?.removeListener(_dummyListener);
-      _prevPreCacheStream = prevAsset != null ? _precacheImage(prevAsset) : null;
-      _nextPreCacheStream = nextAsset != null ? _precacheImage(nextAsset) : null;
-    });
-    _delayedOperations.add(timer);
+    // Stop at bounds
+    if (raw != offset) {
+      _ballisticAnimController.stop();
+      _scrollController.jumpTo(offset);
+      return;
+    }
+
+    // During free-scroll deceleration when scrolling up, don't cross into
+    // the snap zone. Stop at snapOffset so the user can release there cleanly.
+    final snap = _snapOffset;
+    if (prevOffset <= snap && offset > snap) {
+      _ballisticAnimController.stop();
+      _scrollController.jumpTo(snap);
+      return;
+    }
+
+    _scrollController.jumpTo(offset);
   }
 
-  void _onAssetInit(Duration _) {
-    _precacheAssets(widget.initialIndex);
+  void _snapScroll(double velocity) {
+    if (!_scrollController.hasClients) return;
+
+    final offset = _scrollController.offset;
+    final snap = _snapOffset;
+    if (snap <= 0) return;
+
+    // Above snap offset: free scroll or spring back to snap
+    if (offset >= snap) {
+      if (velocity.abs() < _minFlingVelocity) return;
+      if (velocity < -_minFlingVelocity) {
+        _animateScrollTo(snap, velocity);
+        return;
+      }
+      // Scrolling up: decelerate with platform-native physics
+      _ballisticAnimController.value = offset;
+      _ballisticAnimController.animateWith(_createFlingSimulation(offset, velocity));
+      return;
+    }
+
+    // In snap zone (0 → snapOffset): snap to nearest target
+    final double target;
+    if (velocity.abs() > _minFlingVelocity) {
+      target = velocity > 0 ? snap : 0;
+    } else {
+      target = (offset < _minSnapDistance) ? 0 : snap;
+    }
+    _animateScrollTo(target, velocity);
+  }
+
+  void _onDragStart(
+    BuildContext context,
+    DragStartDetails details,
+    PhotoViewControllerBase controller,
+    PhotoViewScaleStateController scaleStateController,
+  ) {
+    _ballisticAnimController.stop();
+    viewController = controller;
+    dragDownPosition = details.localPosition;
+    _dragStartGlobalPosition = details.globalPosition;
+    initialPhotoViewState = controller.value;
+    final showingDetails = ref.read(assetViewerProvider).showingDetails;
+    _dragIntent = showingDetails ? _DragIntent.scroll : _DragIntent.none;
+    final isZoomed =
+        scaleStateController.scaleState == PhotoViewScaleState.zoomedIn ||
+        scaleStateController.scaleState == PhotoViewScaleState.covering;
+    if (!showingDetails && isZoomed) blockGestures = true;
+  }
+
+  void _onDragUpdate(BuildContext context, DragUpdateDetails details, PhotoViewControllerValue controllerValue) {
+    if (blockGestures) return;
+
+    dragInProgress = true;
+
+    if (_dragIntent == _DragIntent.none) {
+      _dragIntent = switch ((details.globalPosition - _dragStartGlobalPosition).dy) {
+        > 1 => _DragIntent.dismiss,
+        < -1 => _DragIntent.scroll,
+        _ => _DragIntent.none,
+      };
+    }
+
+    switch (_dragIntent) {
+      case _DragIntent.none:
+        return;
+      case _DragIntent.dismiss:
+        _handleDragDown(context, details.localPosition - dragDownPosition);
+        return;
+      case _DragIntent.scroll:
+        _scrollBy(details.delta.dy);
+        return;
+    }
+  }
+
+  void _onDragEnd(BuildContext context, DragEndDetails details, PhotoViewControllerValue controllerValue) {
+    dragInProgress = false;
+
+    final intent = _dragIntent;
+    _dragIntent = _DragIntent.none;
+
+    if (intent == _DragIntent.scroll) {
+      _snapScroll(-details.velocity.pixelsPerSecond.dy);
+      return;
+    }
+
+    if (shouldPopOnDrag) {
+      context.maybePop();
+      return;
+    }
+
+    if (blockGestures) {
+      blockGestures = false;
+      return;
+    }
+
+    viewController?.animateMultiple(
+      position: initialPhotoViewState.position,
+      scale: viewController?.initialScale ?? initialPhotoViewState.scale,
+      rotation: initialPhotoViewState.rotation,
+    );
+    ref.read(assetViewerProvider.notifier).setOpacity(255);
+  }
+
+  void _handleDragDown(BuildContext context, Offset delta) {
+    const dragRatio = 0.2;
+    const popThreshold = 75.0;
+
+    final distance = delta.distance;
+    shouldPopOnDrag = delta.dy > 0 && distance > popThreshold;
+
+    final maxScaleDistance = context.height * 0.5;
+    final scaleReduction = (distance / maxScaleDistance).clamp(0.0, dragRatio);
+    final initialScale = viewController?.initialScale ?? initialPhotoViewState.scale;
+    final updatedScale = initialScale != null ? initialScale * (1.0 - scaleReduction) : null;
+
+    final backgroundOpacity = (255 * (1.0 - (scaleReduction / dragRatio))).round();
+
+    viewController?.updateMultiple(position: initialPhotoViewState.position + delta, scale: updatedScale);
+    ref.read(assetViewerProvider.notifier).setOpacity(backgroundOpacity);
+  }
+
+  void _onTapUp(BuildContext context, TapUpDetails details, PhotoViewControllerValue controllerValue) {
+    if (!ref.read(assetViewerProvider).showingDetails) ref.read(assetViewerProvider.notifier).toggleControls();
+  }
+
+  void _onLongPress(BuildContext context, LongPressStartDetails details, PhotoViewControllerValue controllerValue) =>
+      ref.read(isPlayingMotionVideoProvider.notifier).playing = true;
+
+  void _onScaleStateChanged(PhotoViewScaleState scaleState) {
+    if (scaleState != PhotoViewScaleState.initial) {
+      if (!dragInProgress) ref.read(assetViewerProvider.notifier).setControls(false);
+
+      ref.read(videoPlayerControlsProvider.notifier).pause();
+      return;
+    }
+
+    if (!ref.read(assetViewerProvider).showingDetails) ref.read(assetViewerProvider.notifier).setControls(true);
+  }
+
+  void _onAssetInit(Duration timeStamp) {
+    _preloader.preload(widget.initialIndex, context.sizeData);
     _handleCasting();
   }
 
   void _onAssetChanged(int index) async {
+    _ballisticAnimController.stop();
     final timelineService = ref.read(timelineServiceProvider);
     final asset = await timelineService.getAssetAsync(index);
-    if (asset == null) {
-      return;
-    }
+    if (asset == null) return;
 
-    widget.changeAsset(ref, asset);
-    _precacheAssets(index);
+    AssetViewer._setAsset(ref, asset);
+    _preloader.preload(index, context.sizeData);
     _handleCasting();
     _stackChildrenKeepAlive?.close();
     _stackChildrenKeepAlive = ref.read(stackChildrenNotifier(asset).notifier).ref.keepAlive();
@@ -238,216 +400,59 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
     final asset = ref.read(currentAssetNotifier);
     if (asset == null) return;
 
-    // hide any casting snackbars if they exist
-    context.scaffoldMessenger.hideCurrentSnackBar();
-
-    // send image to casting if the server has it
     if (asset is RemoteAsset) {
+      context.scaffoldMessenger.hideCurrentSnackBar();
       ref.read(castProvider.notifier).loadMedia(asset, false);
-    } else {
-      // casting cannot show local assets
-      context.scaffoldMessenger.clearSnackBars();
-
-      if (ref.read(castProvider).isCasting) {
-        ref.read(castProvider.notifier).stop();
-        context.scaffoldMessenger.showSnackBar(
-          SnackBar(
-            duration: const Duration(seconds: 2),
-            content: Text(
-              "local_asset_cast_failed".tr(),
-              style: context.textTheme.bodyLarge?.copyWith(color: context.primaryColor),
-            ),
-          ),
-        );
-      }
+      return;
     }
-  }
 
-  void _onPageBuild(PhotoViewControllerBase controller) {
-    viewController ??= controller;
-    if (showingBottomSheet && bottomSheetController.isAttached) {
-      final verticalOffset =
-          (context.height * bottomSheetController.size) - (context.height * _kBottomSheetMinimumExtent);
-      controller.position = Offset(0, -verticalOffset);
-      // Apply the zoom effect when the bottom sheet is showing
-      controller.scale = (controller.scale ?? 1.0) + 0.01;
-    }
+    context.scaffoldMessenger.clearSnackBars();
+    ref.read(castProvider.notifier).stop();
+    context.scaffoldMessenger.showSnackBar(
+      SnackBar(
+        duration: const Duration(seconds: 2),
+        content: Text(
+          "local_asset_cast_failed".tr(),
+          style: context.textTheme.bodyLarge?.copyWith(color: context.primaryColor),
+        ),
+      ),
+    );
   }
 
   void _onPageChanged(int index, PhotoViewControllerBase? controller) {
     _onAssetChanged(index);
     viewController = controller;
+    _listenForScaleBoundaries(controller);
   }
 
-  void _onDragStart(
-    _,
-    DragStartDetails details,
-    PhotoViewControllerBase controller,
-    PhotoViewScaleStateController scaleStateController,
-  ) {
-    viewController = controller;
-    dragDownPosition = details.localPosition;
-    initialPhotoViewState = controller.value;
-    final isZoomed =
-        scaleStateController.scaleState == PhotoViewScaleState.zoomedIn ||
-        scaleStateController.scaleState == PhotoViewScaleState.covering;
-    if (!showingBottomSheet && isZoomed) {
-      blockGestures = true;
-    }
-  }
-
-  void _onDragEnd(BuildContext ctx, _, __) {
-    dragInProgress = false;
-
-    if (shouldPopOnDrag) {
-      // Dismiss immediately without state updates to avoid rebuilds
-      ctx.maybePop();
-      return;
-    }
-
-    // Do not reset the state if the bottom sheet is showing
-    if (showingBottomSheet) {
-      _snapBottomSheet();
-      return;
-    }
-
-    // If the gestures are blocked, do not reset the state
-    if (blockGestures) {
-      blockGestures = false;
-      return;
-    }
-
-    shouldPopOnDrag = false;
-    hasDraggedDown = null;
-    viewController?.animateMultiple(
-      position: initialPhotoViewState.position,
-      scale: viewController?.initialScale ?? initialPhotoViewState.scale,
-      rotation: initialPhotoViewState.rotation,
-    );
-    ref.read(assetViewerProvider.notifier).setOpacity(255);
-  }
-
-  void _onDragUpdate(BuildContext ctx, DragUpdateDetails details, _) {
-    if (blockGestures) {
-      return;
-    }
-
-    dragInProgress = true;
-    final delta = details.localPosition - dragDownPosition;
-    hasDraggedDown ??= delta.dy > 0;
-    if (!hasDraggedDown! || showingBottomSheet) {
-      _handleDragUp(ctx, delta);
-      return;
-    }
-
-    _handleDragDown(ctx, delta);
-  }
-
-  void _handleDragUp(BuildContext ctx, Offset delta) {
-    const double openThreshold = 50;
-
-    final position = initialPhotoViewState.position + Offset(0, delta.dy);
-    final distanceToOrigin = position.distance;
-
-    viewController?.updateMultiple(position: position);
-    // Moves the bottom sheet when the asset is being dragged up
-    if (showingBottomSheet && bottomSheetController.isAttached) {
-      final centre = (ctx.height * _kBottomSheetMinimumExtent);
-      bottomSheetController.jumpTo((centre + distanceToOrigin) / ctx.height);
-    }
-
-    if (distanceToOrigin > openThreshold && !showingBottomSheet && !ref.read(readonlyModeProvider)) {
-      _openBottomSheet(ctx);
-    }
-  }
-
-  void _handleDragDown(BuildContext ctx, Offset delta) {
-    const double dragRatio = 0.2;
-    const double popThreshold = 75;
-
-    final distance = delta.distance;
-    shouldPopOnDrag = delta.dy > 0 && distance > popThreshold;
-
-    final maxScaleDistance = ctx.height * 0.5;
-    final scaleReduction = (distance / maxScaleDistance).clamp(0.0, dragRatio);
-    double? updatedScale;
-    double? initialScale = viewController?.initialScale ?? initialPhotoViewState.scale;
-    if (initialScale != null) {
-      updatedScale = initialScale * (1.0 - scaleReduction);
-    }
-
-    final backgroundOpacity = (255 * (1.0 - (scaleReduction / dragRatio))).round();
-
-    viewController?.updateMultiple(position: initialPhotoViewState.position + delta, scale: updatedScale);
-    ref.read(assetViewerProvider.notifier).setOpacity(backgroundOpacity);
-  }
-
-  void _onTapDown(_, __, ___) {
-    if (!showingBottomSheet) {
-      ref.read(assetViewerProvider.notifier).toggleControls();
-    }
-  }
-
-  bool _onNotification(Notification delta) {
-    if (delta is DraggableScrollableNotification) {
-      _handleDraggableNotification(delta);
-    }
-
-    // Handle sheet snap manually so that the it snaps only at _kBottomSheetSnapExtent but not after
-    // the isSnapping guard is to prevent the notification from recursively handling the
-    // notification, eventually resulting in a heap overflow
-    if (!isSnapping && delta is ScrollEndNotification) {
-      _snapBottomSheet();
-    }
-    return false;
-  }
-
-  void _handleDraggableNotification(DraggableScrollableNotification delta) {
-    final currentExtent = delta.extent;
-    final isDraggingDown = currentExtent < previousExtent;
-    previousExtent = currentExtent;
-    // Closes the bottom sheet if the user is dragging down
-    if (isDraggingDown && delta.extent < 0.67) {
-      if (dragInProgress) {
-        blockGestures = true;
+  void _listenForScaleBoundaries(PhotoViewControllerBase? controller) {
+    _scaleBoundarySub?.cancel();
+    _scaleBoundarySub = null;
+    if (controller == null || controller.scaleBoundaries != null) return;
+    _scaleBoundarySub = controller.outputStateStream.listen((_) {
+      if (controller.scaleBoundaries != null) {
+        _scaleBoundarySub?.cancel();
+        _scaleBoundarySub = null;
+        if (mounted) setState(() {});
       }
-      // Jump to a lower position before starting close animation to prevent glitch
-      if (bottomSheetController.isAttached) {
-        bottomSheetController.jumpTo(0.67);
-      }
-      sheetCloseController?.close();
-    }
-
-    // If the asset is being dragged down, we do not want to update the asset position again
-    if (dragInProgress) {
-      return;
-    }
-
-    final verticalOffset = _getVerticalOffsetForBottomSheet(delta.extent);
-    // Moves the asset when the bottom sheet is being dragged
-    if (verticalOffset > 0) {
-      viewController?.position = Offset(0, -verticalOffset);
-    }
+    });
   }
 
   void _onEvent(Event event) {
-    if (event is TimelineReloadEvent) {
-      _onTimelineReloadEvent();
-      return;
+    switch (event) {
+      case TimelineReloadEvent():
+        _onTimelineReloadEvent();
+      case ViewerReloadAssetEvent():
+        assetReloadRequested = true;
+      case ViewerShowDetailsEvent():
+        _showDetails();
     }
+  }
 
-    if (event is ViewerReloadAssetEvent) {
-      assetReloadRequested = true;
-      return;
-    }
-
-    if (event is ViewerOpenBottomSheetEvent) {
-      final extent = _kBottomSheetMinimumExtent + 0.3;
-      _openBottomSheet(scaffoldContext!, extent: extent, activitiesMode: event.activitiesMode);
-      final offset = _getVerticalOffsetForBottomSheet(extent);
-      viewController?.position = Offset(0, -offset);
-      return;
-    }
+  void _showDetails() {
+    if (!_scrollController.hasClients || _snapOffset <= 0) return;
+    _ballisticAnimController.stop();
+    _animateScrollTo(_snapOffset, 0);
   }
 
   void _onTimelineReloadEvent() {
@@ -482,88 +487,19 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
 
   void _onAssetReloadEvent(int index) async {
     final timelineService = ref.read(timelineServiceProvider);
-    final newAsset = await timelineService.getAssetAsync(index);
 
-    if (newAsset == null) {
-      return;
-    }
+    final newAsset = await timelineService.getAssetAsync(index);
+    if (newAsset == null) return;
 
     final currentAsset = ref.read(currentAssetNotifier);
-    // Do not reload / close the bottom sheet if the asset has not changed
-    if (newAsset.heroTag == currentAsset?.heroTag) {
-      return;
-    }
 
-    setState(() {
-      _onAssetChanged(pageController.page!.round());
-      sheetCloseController?.close();
-    });
+    // Do not reload if the asset has not changed
+    if (newAsset.heroTag == currentAsset?.heroTag) return;
+
+    _onAssetChanged(index);
   }
 
-  void _openBottomSheet(BuildContext ctx, {double extent = _kBottomSheetMinimumExtent, bool activitiesMode = false}) {
-    ref.read(assetViewerProvider.notifier).setBottomSheet(true);
-    previousExtent = _kBottomSheetMinimumExtent;
-    sheetCloseController = showBottomSheet(
-      context: ctx,
-      sheetAnimationStyle: const AnimationStyle(duration: Durations.medium2, reverseDuration: Durations.medium2),
-      constraints: const BoxConstraints(maxWidth: double.infinity),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20.0))),
-      backgroundColor: ctx.colorScheme.surfaceContainerLowest,
-      builder: (_) {
-        return NotificationListener<Notification>(
-          onNotification: _onNotification,
-          child: activitiesMode
-              ? ActivitiesBottomSheet(controller: bottomSheetController, initialChildSize: extent)
-              : AssetDetailBottomSheet(controller: bottomSheetController, initialChildSize: extent),
-        );
-      },
-    );
-    sheetCloseController?.closed.then((_) => _handleSheetClose());
-  }
-
-  void _handleSheetClose() {
-    viewController?.animateMultiple(position: Offset.zero);
-    viewController?.updateMultiple(scale: viewController?.initialScale);
-    ref.read(assetViewerProvider.notifier).setBottomSheet(false);
-    sheetCloseController = null;
-    shouldPopOnDrag = false;
-    hasDraggedDown = null;
-  }
-
-  void _snapBottomSheet() {
-    if (!bottomSheetController.isAttached ||
-        bottomSheetController.size > _kBottomSheetSnapExtent ||
-        bottomSheetController.size < 0.4) {
-      return;
-    }
-    isSnapping = true;
-    bottomSheetController.animateTo(_kBottomSheetSnapExtent, duration: Durations.short3, curve: Curves.easeOut);
-  }
-
-  Widget _placeholderBuilder(BuildContext ctx, ImageChunkEvent? progress, int index) {
-    return const Center(child: ImmichLoadingIndicator());
-  }
-
-  void _onScaleStateChanged(PhotoViewScaleState scaleState) {
-    if (scaleState != PhotoViewScaleState.initial) {
-      if (!dragInProgress) {
-        ref.read(assetViewerProvider.notifier).setControls(false);
-      }
-      ref.read(videoPlayerControlsProvider.notifier).pause();
-      return;
-    }
-
-    if (!showingBottomSheet) {
-      ref.read(assetViewerProvider.notifier).setControls(true);
-    }
-  }
-
-  void _onLongPress(_, __, ___) {
-    ref.read(isPlayingMotionVideoProvider.notifier).playing = true;
-  }
-
-  PhotoViewGalleryPageOptions _assetBuilder(BuildContext ctx, int index) {
-    scaffoldContext ??= ctx;
+  PhotoViewGalleryPageOptions _assetBuilder(BuildContext context, int index) {
     final timelineService = ref.read(timelineServiceProvider);
     final asset = timelineService.getAssetSafe(index);
 
@@ -572,9 +508,9 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
       return PhotoViewGalleryPageOptions.customChild(
         heroAttributes: PhotoViewHeroAttributes(tag: 'loading_$index'),
         child: Container(
-          width: ctx.width,
-          height: ctx.height,
-          color: backgroundColor,
+          width: context.width,
+          height: context.height,
+          color: Colors.black.withAlpha(ref.read(assetViewerProvider).backgroundOpacity),
           child: const Center(child: CircularProgressIndicator()),
         ),
       );
@@ -587,64 +523,57 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
     }
 
     final isPlayingMotionVideo = ref.read(isPlayingMotionVideoProvider);
-    if (displayAsset.isImage && !isPlayingMotionVideo) {
-      return _imageBuilder(ctx, displayAsset);
-    }
+    if (displayAsset.isImage && !isPlayingMotionVideo) return _imageBuilder(context, displayAsset);
 
-    return _videoBuilder(ctx, displayAsset);
+    return _videoBuilder(context, displayAsset);
   }
 
-  PhotoViewGalleryPageOptions _imageBuilder(BuildContext ctx, BaseAsset asset) {
-    final size = ctx.sizeData;
+  PhotoViewGalleryPageOptions _imageBuilder(BuildContext context, BaseAsset asset) {
+    final size = context.sizeData;
     return PhotoViewGalleryPageOptions(
       key: ValueKey(asset.heroTag),
       imageProvider: getFullImageProvider(asset, size: size),
       heroAttributes: PhotoViewHeroAttributes(tag: '${asset.heroTag}_$heroOffset'),
       filterQuality: FilterQuality.high,
       tightMode: true,
-      disableScaleGestures: showingBottomSheet,
+      disableScaleGestures: ref.read(assetViewerProvider).showingDetails,
       onDragStart: _onDragStart,
       onDragUpdate: _onDragUpdate,
       onDragEnd: _onDragEnd,
-      onTapDown: _onTapDown,
+      onTapUp: _onTapUp,
       onLongPressStart: asset.isMotionPhoto ? _onLongPress : null,
       errorBuilder: (_, __, ___) => Container(
         width: size.width,
         height: size.height,
-        color: backgroundColor,
+        color: Colors.black.withAlpha(ref.read(assetViewerProvider).backgroundOpacity),
         child: Thumbnail.fromAsset(asset: asset, fit: BoxFit.contain),
       ),
     );
   }
 
-  GlobalKey _getVideoPlayerKey(String id) {
-    videoPlayerKeys.putIfAbsent(id, () => GlobalKey());
-    return videoPlayerKeys[id]!;
-  }
-
-  PhotoViewGalleryPageOptions _videoBuilder(BuildContext ctx, BaseAsset asset) {
+  PhotoViewGalleryPageOptions _videoBuilder(BuildContext context, BaseAsset asset) {
     return PhotoViewGalleryPageOptions.customChild(
       onDragStart: _onDragStart,
       onDragUpdate: _onDragUpdate,
       onDragEnd: _onDragEnd,
-      onTapDown: _onTapDown,
+      onTapUp: _onTapUp,
       heroAttributes: PhotoViewHeroAttributes(tag: '${asset.heroTag}_$heroOffset'),
       filterQuality: FilterQuality.high,
       maxScale: 1.0,
       basePosition: Alignment.center,
       disableScaleGestures: true,
       child: SizedBox(
-        width: ctx.width,
-        height: ctx.height,
+        width: context.width,
+        height: context.height,
         child: NativeVideoViewer(
-          key: _getVideoPlayerKey(asset.heroTag),
+          key: videoPlayerKeys.putIfAbsent(asset.heroTag, () => GlobalKey()),
           asset: asset,
           image: Image(
             key: ValueKey(asset),
-            image: getFullImageProvider(asset, size: ctx.sizeData),
+            image: getFullImageProvider(asset, size: context.sizeData),
             fit: BoxFit.contain,
-            height: ctx.height,
-            width: ctx.width,
+            height: context.height,
+            width: context.width,
             alignment: Alignment.center,
           ),
         ),
@@ -652,46 +581,53 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
     );
   }
 
-  void _onPop<T>(bool didPop, T? result) {
-    ref.read(currentAssetNotifier.notifier).dispose();
+  double _getImageHeight(double maxWidth, maxHeight) {
+    final sb = viewController?.scaleBoundaries;
+    if (sb != null) return sb.childSize.height * sb.initialScale;
+
+    final asset = ref.read(currentAssetNotifier);
+    if (asset == null || asset.width == null || asset.height == null) return maxHeight;
+
+    final r = asset.width! / asset.height!;
+    return math.min(maxWidth / r, maxHeight);
   }
 
   @override
   Widget build(BuildContext context) {
     // Rebuild the widget when the asset viewer state changes
     // Using multiple selectors to avoid unnecessary rebuilds for other state changes
-    ref.watch(assetViewerProvider.select((s) => s.showingBottomSheet));
-    ref.watch(assetViewerProvider.select((s) => s.backgroundOpacity));
+    final backgroundColor = Colors.black.withAlpha(ref.watch(assetViewerProvider.select((s) => s.backgroundOpacity)));
     ref.watch(assetViewerProvider.select((s) => s.stackIndex));
     ref.watch(isPlayingMotionVideoProvider);
     final showingControls = ref.watch(assetViewerProvider.select((s) => s.showingControls));
+    final showingDetails = ref.watch(assetViewerProvider.select((s) => s.showingDetails));
+    final padding = MediaQuery.paddingOf(context);
 
     // Listen for casting changes and send initial asset to the cast provider
-    ref.listen(castProvider.select((value) => value.isCasting), (_, isCasting) async {
+    ref.listen(castProvider.select((value) => value.isCasting), (_, isCasting) {
       if (!isCasting) return;
-
-      final asset = ref.read(currentAssetNotifier);
-      if (asset == null) return;
-
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _handleCasting();
       });
     });
 
-    // Listen for control visibility changes and change system UI mode accordingly
-    ref.listen(assetViewerProvider.select((value) => value.showingControls), (_, showingControls) async {
-      if (showingControls) {
-        unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
-      } else {
-        unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky));
-      }
+    ref.listen(assetViewerProvider.select((value) => (value.showingControls, value.showingDetails)), (_, state) {
+      final (controls, details) = state;
+      final mode = !controls || (Platform.isIOS && details) ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge;
+      unawaited(SystemChrome.setEnabledSystemUIMode(mode));
     });
 
-    // Currently it is not possible to scroll the asset when the bottom sheet is open all the way.
-    // Issue: https://github.com/flutter/flutter/issues/109037
-    // TODO: Add a custom scrum builder once the fix lands on stable
+    final viewportWidth = MediaQuery.widthOf(context);
+    final viewportHeight = MediaQuery.heightOf(context);
+
+    final imageHeight = _getImageHeight(viewportWidth, viewportHeight);
+
+    final margin = (viewportHeight - imageHeight) / 2;
+    final overflowBoxHeight = margin + imageHeight - (kMinInteractiveDimension / 2);
+    _snapOffset = (margin + imageHeight) - (viewportHeight / 4);
+
     return PopScope(
-      onPopInvokedWithResult: _onPop,
+      onPopInvokedWithResult: (didPop, result) => ref.read(currentAssetNotifier.notifier).dispose(),
       child: Scaffold(
         backgroundColor: backgroundColor,
         appBar: const ViewerTopAppBar(),
@@ -707,36 +643,116 @@ class _AssetViewerState extends ConsumerState<AssetViewer> {
         ),
         body: Stack(
           children: [
-            PhotoViewGallery.builder(
-              gaplessPlayback: true,
-              loadingBuilder: _placeholderBuilder,
-              pageController: pageController,
-              scrollPhysics: CurrentPlatform.isIOS
-                  ? const FastScrollPhysics() // Use bouncing physics for iOS
-                  : const FastClampingScrollPhysics(), // Use heavy physics for Android
-              itemCount: totalAssets,
-              onPageChanged: _onPageChanged,
-              onPageBuild: _onPageBuild,
-              scaleStateChangedCallback: _onScaleStateChanged,
-              builder: _assetBuilder,
-              backgroundDecoration: BoxDecoration(color: backgroundColor),
-              enablePanAlways: true,
+            SingleChildScrollView(
+              controller: _scrollController,
+              physics: const NeverScrollableScrollPhysics(),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedOverflowBox(
+                    size: Size(double.infinity, overflowBoxHeight),
+                    alignment: Alignment.topCenter,
+                    child: SizedBox(
+                      height: viewportHeight,
+                      child: PhotoViewGallery.builder(
+                        gaplessPlayback: true,
+                        loadingBuilder: (context, progress, index) => const Center(child: ImmichLoadingIndicator()),
+                        pageController: pageController,
+                        scrollPhysics: CurrentPlatform.isIOS
+                            ? const FastScrollPhysics() // Use bouncing physics for iOS
+                            : const FastClampingScrollPhysics(), // Use heavy physics for Android
+                        itemCount: totalAssets,
+                        onPageChanged: _onPageChanged,
+                        scaleStateChangedCallback: _onScaleStateChanged,
+                        builder: _assetBuilder,
+                        backgroundDecoration: BoxDecoration(color: backgroundColor),
+                        enablePanAlways: true,
+                      ),
+                    ),
+                  ),
+                  GestureDetector(
+                    onVerticalDragStart: (_) => _ballisticAnimController.stop(),
+                    onVerticalDragUpdate: (details) => _scrollBy(details.delta.dy),
+                    onVerticalDragEnd: (details) => _snapScroll(-details.velocity.pixelsPerSecond.dy),
+                    child: AnimatedOpacity(
+                      opacity: showingDetails ? 1.0 : 0.0,
+                      duration: kThemeAnimationDuration,
+                      child: AbsorbPointer(
+                        absorbing: !showingDetails,
+                        child: AssetDetails(minHeight: _snapOffset + viewportHeight - overflowBoxHeight),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-            if (!showingBottomSheet)
-              const Positioned(
-                bottom: 0,
+            if (!Platform.isIOS)
+              Positioned(
+                top: 0,
                 left: 0,
                 right: 0,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [AssetStackRow(), ViewerBottomBar()],
+                child: AbsorbPointer(
+                  absorbing: true,
+                  child: AnimatedContainer(
+                    duration: kThemeAnimationDuration,
+                    color: Colors.black.withValues(alpha: showingDetails ? 0.6 : 0.0),
+                    height: padding.top,
+                  ),
                 ),
               ),
+            const Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [AssetStackRow(), ViewerBottomBar()],
+              ),
+            ),
           ],
         ),
       ),
     );
+  }
+}
+
+class _AssetPreloader {
+  static final _dummyListener = ImageStreamListener((image, _) => image.dispose());
+
+  final TimelineService timelineService;
+  final bool Function() mounted;
+
+  Timer? _timer;
+  ImageStream? _prevStream;
+  ImageStream? _nextStream;
+
+  _AssetPreloader({required this.timelineService, required this.mounted});
+
+  void preload(int index, Size size) {
+    unawaited(timelineService.preloadAssets(index));
+    _timer?.cancel();
+    _timer = Timer(Durations.medium4, () async {
+      if (!mounted()) return;
+      final (prev, next) = await (
+        timelineService.getAssetAsync(index - 1),
+        timelineService.getAssetAsync(index + 1),
+      ).wait;
+      if (!mounted()) return;
+      _prevStream?.removeListener(_dummyListener);
+      _nextStream?.removeListener(_dummyListener);
+      _prevStream = prev != null ? _resolveImage(prev, size) : null;
+      _nextStream = next != null ? _resolveImage(next, size) : null;
+    });
+  }
+
+  ImageStream _resolveImage(BaseAsset asset, Size size) {
+    return getFullImageProvider(asset, size: size).resolve(ImageConfiguration.empty)..addListener(_dummyListener);
+  }
+
+  void dispose() {
+    _timer?.cancel();
+    _prevStream?.removeListener(_dummyListener);
+    _nextStream?.removeListener(_dummyListener);
   }
 }

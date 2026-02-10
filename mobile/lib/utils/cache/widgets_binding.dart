@@ -5,4 +5,10 @@ import 'custom_image_cache.dart';
 final class ImmichWidgetsBinding extends WidgetsFlutterBinding {
   @override
   ImageCache createImageCache() => CustomImageCache();
+
+  @override
+  void initInstances() {
+    super.initInstances();
+    resamplingEnabled = true;
+  }
 }
